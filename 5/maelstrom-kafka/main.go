@@ -50,7 +50,11 @@ func main() {
 
 			// attempt CAS write
 			offset := len(messages)
-			newMessages := append(messages, []int{offset, body.Msg})
+			
+			newMessages := make([][]int, len(messages)+1)
+			copy(newMessages, messages)
+			newMessages[len(messages)] = []int{offset, body.Msg}
+
 			var err error
 			if createFromNotExist {
 				err = kv.CompareAndSwap(ctx, key, messages, newMessages, true)
