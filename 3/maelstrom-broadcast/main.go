@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -14,8 +15,50 @@ var (
 	mu          sync.RWMutex
 )
 
+func snapshotMessages() []int {
+	// helper to convert hashset to slice with read lock
+	mu.RLock()
+	defer mu.RUnlock()
+
+	msgs := make([]int, 0, len(message_set))
+	for m := range message_set {
+		msgs = append(msgs, m)
+	}
+	return msgs
+}
+
 func main() {
 	n := maelstrom.NewNode()
+
+	// non-blocking periodic gossiping
+	go func() {
+		ticker := time.NewTicker(300 * time.Millisecond) // 200–500ms common
+		defer ticker.Stop()
+
+		for range ticker.C {
+			mu.RLock()
+			nbs := append([]string(nil), neighbors...)
+			mu.RUnlock()
+
+			if len(nbs) == 0 {
+				continue
+			}
+
+			msgs := snapshotMessages()
+			if len(msgs) == 0 {
+				continue
+			}
+
+			for _, nb := range nbs {
+				for _, msg := range msgs {
+					go n.Send(nb, map[string]any{
+						"type":    "gossip",
+						"message": msg,
+					})
+				}
+			}
+		}
+	}()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body map[string]any
@@ -51,7 +94,7 @@ func main() {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		
+
 		// write lock to write to hashset
 		mu.Lock()
 		message := int(body["message"].(float64))
