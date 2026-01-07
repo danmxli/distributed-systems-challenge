@@ -10,22 +10,11 @@ import (
 )
 
 var (
-	message_set = make(map[int]struct{})
-	neighbors   = make([]string, 0)
-	mu          sync.RWMutex
+	msg_lookup = make(map[int]struct{}) // hashset to track seen messages
+	msg_data   = make([]int, 0)
+	neighbors  = make([]string, 0)
+	mu         sync.RWMutex
 )
-
-func snapshotMessages() []int {
-	// helper to convert hashset to slice with read lock
-	mu.RLock()
-	defer mu.RUnlock()
-
-	msgs := make([]int, 0, len(message_set))
-	for m := range message_set {
-		msgs = append(msgs, m)
-	}
-	return msgs
-}
 
 func main() {
 	n := maelstrom.NewNode()
@@ -44,98 +33,99 @@ func main() {
 				continue
 			}
 
-			msgs := snapshotMessages()
+			mu.RLock()
+			msgs := append([]int(nil), msg_data...)
+			mu.RUnlock()
+
 			if len(msgs) == 0 {
 				continue
 			}
 
 			for _, nb := range nbs {
-				for _, msg := range msgs {
-					go n.Send(nb, map[string]any{
-						"type":    "gossip",
-						"message": msg,
-					})
-				}
+				go n.Send(nb, map[string]any{
+					"type":     "gossip",
+					"messages": msgs,
+				})
 			}
 		}
 	}()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		var body map[string]any
+		var body BroadcastMessageBody
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		message := int(body["message"].(float64))
-
+		// write lock
 		mu.Lock()
-		message_set[message] = struct{}{}
+		_, exists := msg_lookup[body.Message]
+		if !exists {
+			msg_data = append(msg_data, body.Message)
+			msg_lookup[body.Message] = struct{}{}
+		}
 		mu.Unlock()
 
-		// first reply to sender
-		if err := n.Reply(msg, map[string]any{"type": "broadcast_ok"}); err != nil {
-			return err
-		}
-
 		// gossip to neighbors
-		mu.RLock()
-		nbs := append([]string(nil), neighbors...)
-		mu.RUnlock()
-		for _, neighbor := range nbs {
-			if neighbor == msg.Src {
-				continue
+		if !exists {
+			mu.RLock()
+			nbs := append([]string(nil), neighbors...)
+			mu.RUnlock()
+			for _, nb := range nbs {
+				go n.Send(nb, map[string]any{
+					"type":     "gossip",
+					"messages": []int{body.Message},
+				})
 			}
-			go n.Send(neighbor, map[string]any{
-				"type":    "gossip",
-				"message": message,
-			})
 		}
 
-		return nil
+		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
 	})
 
 	n.Handle("gossip", func(msg maelstrom.Message) error {
-		// no reply needed for gossip
-		var body map[string]any
+		var body GossipMessageBody
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		// write lock to write to hashset
+		// write lock
 		mu.Lock()
-		message := int(body["message"].(float64))
-		if _, exists := message_set[message]; exists {
-			// already seen
-			mu.Unlock()
-			return nil
+		newMsgs := make([]int, 0)
+		for _, message := range body.Messages {
+			if _, exists := msg_lookup[message]; !exists {
+				msg_lookup[message] = struct{}{}
+				msg_data = append(msg_data, message)
+				newMsgs = append(newMsgs, message)
+			}
 		}
-
-		message_set[message] = struct{}{}
 		mu.Unlock()
 
 		// gossip to neighbors
-		mu.RLock()
-		nbs := append([]string(nil), neighbors...)
-		mu.RUnlock()
-		for _, neighbor := range nbs {
-			if neighbor == msg.Src {
-				continue
+		if len(newMsgs) > 0 {
+			mu.RLock()
+			nbs := append([]string(nil), neighbors...)
+			mu.RUnlock()
+			for _, nb := range nbs {
+				if nb == msg.Src {
+					continue
+				}
+				go n.Send(nb, map[string]any{
+					"type":     "gossip",
+					"messages": newMsgs,
+				})
 			}
-			go n.Send(neighbor, map[string]any{
-				"type":    "gossip",
-				"message": message,
-			})
 		}
 		return nil
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		// read lock to read from hashset
-		mu.RLock()
-		messages := make([]int, 0, len(message_set))
-		for message := range message_set {
-			messages = append(messages, message)
+		var body ReadMessageBody
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
 		}
+
+		// read lock
+		mu.RLock()
+		messages := append([]int(nil), msg_data...)
 		mu.RUnlock()
 
 		return n.Reply(msg, map[string]any{
@@ -145,23 +135,23 @@ func main() {
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body map[string]any
+		var body TopologyMessageBody
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		// extract neighboring nodes from topology
-		topology := body["topology"].(map[string]any)
-		node_id := n.ID()
-
-		// write lock to update neighbors
+		// use a star topology with n0 as the hub
 		mu.Lock()
-		// clear previous neighbors
-		neighbors = neighbors[:0]
-
-		// store neighboring nodes
-		for _, neighbor := range topology[node_id].([]any) {
-			neighbors = append(neighbors, neighbor.(string))
+		allNodes := n.NodeIDs()
+		hub := allNodes[0]
+		if n.ID() == hub {
+			for _, node := range allNodes {
+				if node != hub {
+					neighbors = append(neighbors, node)
+				}
+			}
+		} else {
+			neighbors = []string{hub}
 		}
 		mu.Unlock()
 
@@ -173,4 +163,24 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+type TopologyMessageBody struct {
+	maelstrom.MessageBody
+	Topology map[string][]string `json:"topology"`
+}
+
+type BroadcastMessageBody struct {
+	maelstrom.MessageBody
+	Message int `json:"message"`
+}
+
+type GossipMessageBody struct {
+	maelstrom.MessageBody
+	Messages []int `json:"messages"`
+}
+
+type ReadMessageBody struct {
+	maelstrom.MessageBody
+	Messages []int `json:"messages"`
 }
