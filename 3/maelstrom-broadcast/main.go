@@ -67,7 +67,10 @@ func main() {
 		}
 
 		message := int(body["message"].(float64))
+
+		mu.Lock()
 		message_set[message] = struct{}{}
+		mu.Unlock()
 
 		// first reply to sender
 		if err := n.Reply(msg, map[string]any{"type": "broadcast_ok"}); err != nil {
@@ -75,7 +78,10 @@ func main() {
 		}
 
 		// gossip to neighbors
-		for _, neighbor := range neighbors {
+		mu.RLock()
+		nbs := append([]string(nil), neighbors...)
+		mu.RUnlock()
+		for _, neighbor := range nbs {
 			if neighbor == msg.Src {
 				continue
 			}
@@ -108,7 +114,10 @@ func main() {
 		mu.Unlock()
 
 		// gossip to neighbors
-		for _, neighbor := range neighbors {
+		mu.RLock()
+		nbs := append([]string(nil), neighbors...)
+		mu.RUnlock()
+		for _, neighbor := range nbs {
 			if neighbor == msg.Src {
 				continue
 			}
